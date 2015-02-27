@@ -938,21 +938,26 @@ static NSString *const kInlineFileBase64String = @"base64 string";  // NSMutable
 - (void)linefeed
 {
     LineBuffer *lineBufferToUse = linebuffer_;
-    if (currentGrid_ == altGrid_ && !saveToScrollbackInAlternateScreen_) {
+    const BOOL noScrollback = (currentGrid_ == altGrid_ && !saveToScrollbackInAlternateScreen_);
+    if (noScrollback) {
         // In alt grid but saving to scrollback in alt-screen is off, so pass in a nil linebuffer.
         lineBufferToUse = nil;
-        // This is a temporary hack. In this case, keeping the selection in the right place requires
-        // more cooperation between VT100Screen and PTYTextView than is currently in place because
-        // the selection could become truncated, and regardless, will need to move up a line in terms
-        // of absolute Y position (normally when the screen scrolls the absolute Y position of the
-        // selection stays the same and the viewport moves down, or else there is soem scrollback
-        // overflow and PTYTextView -refresh bumps the selection's Y position, but because in this
-        // case we don't append to the line buffer, scrollback overflow will not increment).
-        [delegate_ screenRemoveSelection];
     }
     [self incrementOverflowBy:[currentGrid_ moveCursorDownOneLineScrollingIntoLineBuffer:lineBufferToUse
                                                                      unlimitedScrollback:unlimitedScrollback_
-                                                                 useScrollbackWithRegion:_appendToScrollbackWithStatusBar]];
+                                                                 useScrollbackWithRegion:_appendToScrollbackWithStatusBar
+                               willScroll:^{
+                                   if (noScrollback) {
+                                       // This is a temporary hack. In this case, keeping the selection in the right place requires
+                                       // more cooperation between VT100Screen and PTYTextView than is currently in place because
+                                       // the selection could become truncated, and regardless, will need to move up a line in terms
+                                       // of absolute Y position (normally when the screen scrolls the absolute Y position of the
+                                       // selection stays the same and the viewport moves down, or else there is soem scrollback
+                                       // overflow and PTYTextView -refresh bumps the selection's Y position, but because in this
+                                       // case we don't append to the line buffer, scrollback overflow will not increment).
+                                       [delegate_ screenRemoveSelection];
+                                   }
+                               }]];
 }
 
 - (void)cursorToX:(int)x
@@ -1919,27 +1924,75 @@ static NSString *const kInlineFileBase64String = @"base64 string";  // NSMutable
     [self activateBell];
 }
 
-- (void)terminalBackspace {
+- (void)doBackspace {
     int leftMargin = currentGrid_.leftMargin;
+    int rightMargin = currentGrid_.rightMargin;
     int cursorX = currentGrid_.cursorX;
     int cursorY = currentGrid_.cursorY;
 
-    if (cursorX > leftMargin) {
-        // Cursor can move back without hitting the left margin; easy and normal case.
+    if ([self shouldReverseWrap]) {
+        currentGrid_.cursor = VT100GridCoordMake(rightMargin, cursorY - 1);
+    } else if (cursorX > leftMargin ||  // Cursor can move back without hitting the left margin: normal case
+               (cursorX < leftMargin && cursorX > 0)) {  // Cursor left of left margin, right of left edge.
         if (cursorX >= currentGrid_.size.width) {
+            // Cursor right of right edge, move back twice.
             currentGrid_.cursorX = cursorX - 2;
         } else {
+            // Normal case.
             currentGrid_.cursorX = cursorX - 1;
         }
-    } else if (cursorX == 0 && cursorY > 0 && !currentGrid_.useScrollRegionCols) {
-        // Cursor is at the left margin and can wrap around.
-        screen_char_t* aLine = [self getLineAtScreenIndex:cursorY - 1];
-        if (aLine[currentGrid_.size.width].code == EOL_SOFT) {
-            currentGrid_.cursor = VT100GridCoordMake(currentGrid_.size.width - 1, cursorY - 1);
-        } else if (aLine[currentGrid_.size.width].code == EOL_DWC) {
-            currentGrid_.cursor = VT100GridCoordMake(currentGrid_.size.width - 2, cursorY - 1);
-        }
     }
+
+    // Make sure we didn't land on the right half of a double-width character
+    screen_char_t *aLine = [self getLineAtScreenIndex:currentGrid_.cursorY];
+    unichar c = aLine[currentGrid_.cursorX].code;
+    if ((c == DWC_RIGHT || c == DWC_SKIP) && !aLine[currentGrid_.cursorX].complexChar) {
+        [self doBackspace];
+    }
+}
+
+// Reverse wrap is allowed when the cursor is on the left margin or left edge, wraparoundMode is
+// set, the cursor is not at the top margin/edge, and:
+// 1. reverseWraparoundMode is set (xterm's rule), or
+// 2. there's no left-right margin and the preceding line has EOL_SOFT (Terminal.app's rule)
+- (BOOL)shouldReverseWrap {
+    if (!terminal_.wraparoundMode) {
+        return NO;
+    }
+
+    // Cursor must be at left margin/edge.
+    int leftMargin = currentGrid_.leftMargin;
+    int cursorX = currentGrid_.cursorX;
+    if (cursorX != leftMargin && cursorX != 0) {
+        return NO;
+    }
+
+    // Cursor must not be at top margin/edge.
+    int topMargin = currentGrid_.topMargin;
+    int cursorY = currentGrid_.cursorY;
+    if (cursorY == topMargin || cursorY == 0) {
+        return NO;
+    }
+
+    // If reverseWraparoundMode is reset, then allow only if there's a soft newline on previous line
+    if (!terminal_.reverseWraparoundMode) {
+        if (currentGrid_.useScrollRegionCols) {
+            return NO;
+        }
+
+        screen_char_t *line = [self getLineAtScreenIndex:cursorY - 1];
+        unichar c = line[self.width].code;
+        return (c == EOL_SOFT || c == EOL_DWC);
+    }
+
+    return YES;
+}
+
+- (void)terminalBackspace {
+    int cursorX = currentGrid_.cursorX;
+    int cursorY = currentGrid_.cursorY;
+
+    [self doBackspace];
 
     if (commandStartX_ != -1 && (currentGrid_.cursorX != cursorX ||
                                  currentGrid_.cursorY != cursorY)) {
@@ -2497,6 +2550,12 @@ static NSString *const kInlineFileBase64String = @"base64 string";  // NSMutable
 }
 
 - (void)terminalSetRows:(int)rows andColumns:(int)columns {
+    if (rows == -1) {
+        rows = self.height;
+    }
+    if (columns == -1) {
+        columns = self.width;
+    }
     if ([delegate_ screenShouldInitiateWindowResize] &&
         ![delegate_ screenWindowIsFullscreen]) {
         [delegate_ screenResizeToWidth:columns
@@ -2604,6 +2663,8 @@ static NSString *const kInlineFileBase64String = @"base64 string";  // NSMutable
 
 - (NSString *)terminalIconTitle {
     if (allowTitleReporting_) {
+        // TODO: Should be something like screenRawName (which doesn't exist yet but would return
+        // [self rawName]), not screenWindowTitle, right?
         return [delegate_ screenWindowTitle] ? [delegate_ screenWindowTitle] : [delegate_ screenDefaultName];
     } else {
         return @"";
@@ -3332,6 +3393,29 @@ static NSString *const kInlineFileBase64String = @"base64 string";  // NSMutable
 
 - (NSString *)terminalProfileName {
     return [delegate_ screenProfileName];
+}
+
+- (VT100GridRect)terminalScrollRegion {
+    return currentGrid_.scrollRegionRect;
+}
+
+- (int)terminalChecksumInRectangle:(VT100GridRect)rect {
+    int result = 0;
+    for (int y = rect.origin.y; y < rect.origin.y + rect.size.height; y++) {
+        screen_char_t *theLine = [self getLineAtScreenIndex:y];
+        for (int x = rect.origin.x; x < rect.origin.x + rect.size.width; x++) {
+            unichar code = theLine[x].code;
+            BOOL isPrivate = (code < ITERM2_PRIVATE_BEGIN &&
+                              code > ITERM2_PRIVATE_END);
+            if (code && !isPrivate) {
+                NSString *s = ScreenCharToStr(&theLine[x]);
+                for (int i = 0; i < s.length; i++) {
+                    result += (int)[s characterAtIndex:i];
+                }
+            }
+        }
+    }
+    return result;
 }
 
 #pragma mark - Private

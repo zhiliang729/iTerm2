@@ -26,7 +26,8 @@
 @end
 
 @implementation VT100Terminal {
-    // True if between BeginFile and EndFile codes.
+    // True if receiving a file in multitoken mode, or if between BeginFile and
+    // EndFile codes (which are deprecated).
     BOOL receivingFile_;
 
     // In FinalTerm command mode (user is at the prompt typing a command).
@@ -60,6 +61,7 @@
     ColorMode saveBgColorMode_;
     BOOL saveOriginMode_;
     BOOL saveWraparoundMode_;
+    BOOL saveReverseWraparoundMode_;
 
     int sendModifiers_[NUM_MODIFIABLE_RESOURCES];
 }
@@ -140,6 +142,7 @@ static const int kMaxScreenRows = 4096;
         _parser.encoding = _encoding;
 
         _wraparoundMode = YES;
+        _reverseWraparoundMode = NO;
         _autorepeatMode = YES;
         xon_ = YES;
         fgColorCode_ = ALTSEM_DEFAULT;
@@ -221,6 +224,7 @@ static const int kMaxScreenRows = 4096;
     saveBgColorMode_ = bgColorMode_;
     saveOriginMode_ = self.originMode;
     saveWraparoundMode_ = self.wraparoundMode;
+    saveReverseWraparoundMode_ = self.reverseWraparoundMode;
 }
 
 - (void)restoreTextAttributes
@@ -242,6 +246,7 @@ static const int kMaxScreenRows = 4096;
     bgColorMode_ = saveBgColorMode_;
     self.originMode = saveOriginMode_;
     self.wraparoundMode = saveWraparoundMode_;
+    self.reverseWraparoundMode = saveReverseWraparoundMode_;
 }
 
 - (void)setForeground24BitColor:(NSColor *)color {
@@ -279,6 +284,7 @@ static const int kMaxScreenRows = 4096;
     _reverseVideo = NO;
     _originMode = NO;
     self.wraparoundMode = YES;
+    self.reverseWraparoundMode = NO;
     self.autorepeatMode = YES;
     self.keypadMode = NO;
     self.insertMode = NO;
@@ -309,8 +315,7 @@ static const int kMaxScreenRows = 4096;
     [delegate_ terminalResetPreservingPrompt:preservePrompt];
 }
 
-- (void)setWraparoundMode:(BOOL)mode
-{
+- (void)setWraparoundMode:(BOOL)mode {
     if (mode != _wraparoundMode) {
         _wraparoundMode = mode;
         [delegate_ terminalWraparoundModeDidChangeTo:mode];
@@ -434,9 +439,6 @@ static const int kMaxScreenRows = 4096;
 
             for (i = 0; i < token.csi->count; i++) {
                 switch (token.csi->p[i]) {
-                    case 20:
-                        self.lineMode = mode;
-                        break;
                     case 1:
                         self.cursorMode = mode;
                         break;
@@ -466,43 +468,18 @@ static const int kMaxScreenRows = 4096;
                     case 9:
                         // TODO: This should send mouse x&y on button press.
                         break;
+                    case 20:
+                        self.lineMode = mode;
+                        break;
                     case 25:
                         [delegate_ terminalSetCursorVisible:mode];
                         break;
                     case 40:
                         self.allowColumnMode = mode;
                         break;
-                    case 69:
-                        [delegate_ terminalSetUseColumnScrollRegion:mode];
+                    case 45:
+                        self.reverseWraparoundMode = mode;
                         break;
-
-                    case 1049:
-                        // From the xterm release log:
-                        // Implement new escape sequence, private mode 1049, which combines
-                        // the switch to/from alternate screen mode with screen clearing and
-                        // cursor save/restore.  Unlike the existing escape sequence, this
-                        // clears the alternate screen when switching to it rather than when
-                        // switching to the normal screen, thus retaining the alternate screen
-                        // contents for select/paste operations.
-                        if (!self.disableSmcupRmcup) {
-                            if (mode) {
-                                [self saveTextAttributes];
-                                [delegate_ terminalSaveCharsetFlags];
-                                [delegate_ terminalShowAltBuffer];
-                                [delegate_ terminalClearScreen];
-                            } else {
-                                [delegate_ terminalShowPrimaryBufferRestoringCursor:YES];
-                                [self restoreTextAttributes];
-                                [delegate_ terminalRestoreCharsetFlags];
-                            }
-                        }
-                        break;
-
-                    case 2004:
-                        // Set bracketed paste mode
-                        self.bracketedPasteMode = mode;
-                        break;
-
                     case 47:
                         // alternate screen buffer mode
                         if (!self.disableSmcupRmcup) {
@@ -512,6 +489,10 @@ static const int kMaxScreenRows = 4096;
                                 [delegate_ terminalShowPrimaryBufferRestoringCursor:NO];
                             }
                         }
+                        break;
+
+                    case 69:
+                        [delegate_ terminalSetUseColumnScrollRegion:mode];
                         break;
 
                     case 1000:
@@ -554,6 +535,33 @@ static const int kMaxScreenRows = 4096;
                             self.mouseFormat = MOUSE_FORMAT_XTERM;
                         }
                         break;
+                    case 1049:
+                        // From the xterm release log:
+                        // Implement new escape sequence, private mode 1049, which combines
+                        // the switch to/from alternate screen mode with screen clearing and
+                        // cursor save/restore.  Unlike the existing escape sequence, this
+                        // clears the alternate screen when switching to it rather than when
+                        // switching to the normal screen, thus retaining the alternate screen
+                        // contents for select/paste operations.
+                        if (!self.disableSmcupRmcup) {
+                            if (mode) {
+                                [self saveTextAttributes];
+                                [delegate_ terminalSaveCharsetFlags];
+                                [delegate_ terminalShowAltBuffer];
+                                [delegate_ terminalClearScreen];
+                            } else {
+                                [delegate_ terminalShowPrimaryBufferRestoringCursor:YES];
+                                [self restoreTextAttributes];
+                                [delegate_ terminalRestoreCharsetFlags];
+                            }
+                        }
+                        break;
+
+                    case 2004:
+                        // Set bracketed paste mode
+                        self.bracketedPasteMode = mode;
+                        break;
+
                 }
             }
             break;
@@ -589,7 +597,8 @@ static const int kMaxScreenRows = 4096;
             break;
         case VT100CSI_DECSTR:
             self.wraparoundMode = YES;
-            self.originMode = NO;
+            self.reverseWraparoundMode = NO;
+            // resetSGR is performed prior to the switch, which takes care of various other flags.
             break;
         case VT100CSI_RESET_MODIFIERS:
             if (token.csi->count == 0) {
@@ -916,6 +925,89 @@ static const int kMaxScreenRows = 4096;
     }
 }
 
+- (VT100GridRect)rectangleInToken:(VT100Token *)token
+                  startingAtIndex:(int)index
+                 defaultRectangle:(VT100GridRect)defaultRectangle {
+    CSIParam *csi = token.csi;
+    VT100GridCoord defaultMax = VT100GridRectMax(defaultRectangle);
+
+    // First, construct a coord range from the passed-in parameters. They may be -1 for default
+    // values.
+    int top = csi->p[index];
+    int left = csi->p[index + 1];
+    int bottom = csi->p[index + 2];
+    int right = csi->p[index + 3];
+    VT100GridCoordRange coordRange = VT100GridCoordRangeMake(left, top, right, bottom);
+
+    // If in origin mode, offset non-default coordinates by the origin of the scroll region.
+    if (self.originMode) {
+        VT100GridRect region = [delegate_ terminalScrollRegion];
+        if (coordRange.start.x >= 0) {
+            coordRange.start.x -= region.origin.x;
+        }
+        if (coordRange.start.y >= 0) {
+            coordRange.start.y -= region.origin.y;
+        }
+        if (coordRange.end.x >= 0) {
+            coordRange.end.x -= region.origin.x;
+        }
+        if (coordRange.end.y >= 0) {
+            coordRange.end.y -= region.origin.y;
+        }
+    }
+
+    // Replace default values with the passed-in defaults.
+    if (coordRange.start.x < 0) {
+        coordRange.start.x = defaultRectangle.origin.x + 1;
+    }
+    if (coordRange.start.y < 0) {
+        coordRange.start.y = defaultRectangle.origin.y + 1;
+    }
+    if (coordRange.end.x < 0) {
+        coordRange.end.x = defaultMax.x + 1;
+    }
+    if (coordRange.end.y < 0) {
+        coordRange.end.y = defaultMax.y + 1;
+    }
+
+    // Convert the coordRange to a 0-based rect (all coords are 1-based so far) and return it.
+    return VT100GridRectMake(coordRange.start.x - 1,
+                             coordRange.start.y - 1,
+                             coordRange.end.x - coordRange.start.x + 1,
+                             coordRange.end.y - coordRange.start.y + 1);
+}
+
+- (BOOL)rectangleIsValid:(VT100GridRect)rect {
+    if (self.originMode) {
+        VT100GridRect scrollRegion = [delegate_ terminalScrollRegion];
+        if (rect.origin.y < scrollRegion.origin.y ||
+            rect.origin.x < scrollRegion.origin.x ||
+            VT100GridRectMax(rect).y > VT100GridRectMax(scrollRegion).y ||
+            VT100GridRectMax(rect).x > VT100GridRectMax(scrollRegion).x) {
+            return NO;
+        }
+    }
+    return (rect.size.width >= 0 &&
+            rect.size.height >= 0);
+}
+
+- (void)sendChecksumReportWithId:(int)identifier
+                       rectangle:(VT100GridRect)rect {
+    if (![delegate_ terminalShouldSendReport]) {
+        return;
+    }
+    if (identifier < 0) {
+        return;
+    }
+    if (![self rectangleIsValid:rect]) {
+        return;
+    }
+    // TODO: Respect origin mode
+    int checksum = [delegate_ terminalChecksumInRectangle:rect];
+    // DCS Pid ! ~ D..D ST
+    [delegate_ terminalSendReport:[self.output reportChecksum:checksum withIdentifier:identifier]];
+}
+
 - (NSString *)decodedBase64PasteCommand:(NSString *)commandString {
     //
     // - write access
@@ -996,27 +1088,17 @@ static const int kMaxScreenRows = 4096;
         return;
     }
 
-    // Handle sending input to pasteboard/receving files.
+    // Handle file downloads, which come as a series of MULTITOKEN_BODY tokens.
     if (receivingFile_) {
-        if (token->type == VT100CC_BEL) {
-            [delegate_ terminalDidFinishReceivingFile];
-            receivingFile_ = NO;
+        if (token->type == XTERMCC_MULTITOKEN_BODY) {
+            [delegate_ terminalDidReceiveBase64FileData:token.string];
             return;
         } else if (token->type == VT100_ASCIISTRING) {
             [delegate_ terminalDidReceiveBase64FileData:[token stringForAsciiData]];
             return;
-        } else if (token->type == VT100CC_CR ||
-                   token->type == VT100CC_LF) {
-          return;
-        } else  if (token->type == XTERMCC_SET_KVP) {
-          NSArray *kvp = [self keyValuePairInToken:token];
-          if ([kvp[0] isEqualToString:@"EndFile"]) {
-            [self executeXtermSetKvp:token];
-          } else {
-            [delegate_ terminalFileReceiptEndedUnexpectedly];
-            receivingFile_ = NO;
-          }
-          return;
+        } else if (token->type == XTERMCC_MULTITOKEN_END) {
+            [delegate_ terminalDidFinishReceivingFile];
+            return;
         } else {
             [delegate_ terminalFileReceiptEndedUnexpectedly];
             receivingFile_ = NO;
@@ -1040,11 +1122,11 @@ static const int kMaxScreenRows = 4096;
         case VT100CSI_DECSLRM_OR_ANSICSI_SCP:
             if ([delegate_ terminalUseColumnScrollRegion]) {
                 token->type = VT100CSI_DECSLRM;
-                SET_PARAM_DEFAULT(token.csi, 0, 1);
-                SET_PARAM_DEFAULT(token.csi, 1, 1);
+                iTermParserSetCSIParameterIfDefault(token.csi, 0, 1);
+                iTermParserSetCSIParameterIfDefault(token.csi, 1, 1);
             } else {
                 token->type = ANSICSI_SCP;
-                SET_PARAM_DEFAULT(token.csi, 0, 0);
+                iTermParserSetCSIParameterIfDefault(token.csi, 0, 0);
             }
             break;
 
@@ -1071,8 +1153,9 @@ static const int kMaxScreenRows = 4096;
         case VT100_NOTSUPPORT:
             break;
 
-            //  VT100 CC
+        //  VT100 CC
         case VT100CC_ENQ:
+            // TODO: Add support for an answerback string here.
             break;
         case VT100CC_BEL:
             [delegate_ terminalRingBell];
@@ -1148,31 +1231,46 @@ static const int kMaxScreenRows = 4096;
         case VT100CSI_DECID:
         case VT100CSI_DECKPAM:
         case VT100CSI_DECKPNM:
-        case VT100CSI_DECLL:
             break;
+
+        case ANSICSI_RCP:
         case VT100CSI_DECRC:
             [self restoreTextAttributes];
             [delegate_ terminalRestoreCursor];
             [delegate_ terminalRestoreCharsetFlags];
             break;
-        case VT100CSI_DECREPTPARM:
-        case VT100CSI_DECREQTPARM:
-            break;
+
+        case ANSICSI_SCP:
+            // ANSI SC is just like DECSC, but it's only available when left-right mode is off.
+            // There's code before the big switch statement that changes the token type for this
+            // case, so if we get here it's definitely the same as DECSC.
+            // Fall through.
         case VT100CSI_DECSC:
             [self saveTextAttributes];
             [delegate_ terminalSaveCursor];
             [delegate_ terminalSaveCharsetFlags];
             break;
+
         case VT100CSI_DECSTBM:
-            [delegate_ terminalSetScrollRegionTop:token.csi->p[0] == 0 ? 0 : token.csi->p[0] - 1
-                                           bottom:token.csi->p[1] == 0 ? [delegate_ terminalHeight] - 1 : token.csi->p[1] - 1];
-            break;
-        case VT100CSI_DECSWL:
-        case VT100CSI_DECTST:
+            [delegate_ terminalSetScrollRegionTop:token.csi->p[0] == -1 ? 0 : token.csi->p[0] - 1
+                                           bottom:token.csi->p[1] == -1 ? [delegate_ terminalHeight] - 1 : token.csi->p[1] - 1];
             break;
         case VT100CSI_DSR:
             [self handleDeviceStatusReportWithToken:token withQuestion:NO];
             break;
+        case VT100CSI_DECRQCRA: {
+            VT100GridRect defaultRectangle = VT100GridRectMake(0,
+                                                               0,
+                                                               [delegate_ terminalWidth],
+                                                               [delegate_ terminalHeight]);
+            // xterm incorrectly uses the second parameter for the Pid. Since I use this mostly to
+            // test xterm compatibility, it's handy to be bugwards-compatible.
+            [self sendChecksumReportWithId:token.csi->p[1]
+                                 rectangle:[self rectangleInToken:token
+                                                  startingAtIndex:2
+                                                 defaultRectangle:defaultRectangle]];
+            break;
+        }
         case VT100CSI_DECDSR:
             [self handleDeviceStatusReportWithToken:token withQuestion:YES];
             break;
@@ -1399,22 +1497,14 @@ static const int kMaxScreenRows = 4096;
                     [delegate_ terminalPrintScreen];
             }
             break;
-        case ANSICSI_SCP:
-            [delegate_ terminalSaveCursor];
-            [delegate_ terminalSaveCharsetFlags];
-            break;
-        case ANSICSI_RCP:
-            [delegate_ terminalRestoreCursor];
-            [delegate_ terminalRestoreCharsetFlags];
-            break;
 
             // XTERM extensions
         case XTERMCC_WIN_TITLE:
-            [delegate_ terminalSetWindowTitle:token.string];
+            [delegate_ terminalSetWindowTitle:[token.string stringByReplacingControlCharsWithQuestionMark]];
             break;
         case XTERMCC_WINICON_TITLE:
-            [delegate_ terminalSetWindowTitle:token.string];
-            [delegate_ terminalSetIconTitle:token.string];
+            [delegate_ terminalSetWindowTitle:[token.string stringByReplacingControlCharsWithQuestionMark]];
+            [delegate_ terminalSetIconTitle:[token.string stringByReplacingControlCharsWithQuestionMark]];
             break;
         case XTERMCC_PASTE64: {
             NSString *decoded = [self decodedBase64PasteCommand:token.string];
@@ -1427,9 +1517,9 @@ static const int kMaxScreenRows = 4096;
             [self executeFinalTermToken:token];
             break;
         case XTERMCC_ICON_TITLE:
-            [delegate_ terminalSetIconTitle:token.string];
+            [delegate_ terminalSetIconTitle:[token.string stringByReplacingControlCharsWithQuestionMark]];
             break;
-        case XTERMCC_INSBLNK:
+        case VT100CSI_ICH:
             [delegate_ terminalInsertEmptyCharsAtCursor:token.csi->p[0]];
             break;
         case XTERMCC_INSLN:
@@ -1469,7 +1559,9 @@ static const int kMaxScreenRows = 4096;
             [delegate_ terminalScrollUp:token.csi->p[0]];
             break;
         case XTERMCC_SD:
-            [delegate_ terminalScrollDown:token.csi->p[0]];
+            if (token.csi->count == 1) {
+                [delegate_ terminalScrollDown:token.csi->p[0]];
+            }
             break;
         case XTERMCC_REPORT_WIN_STATE: {
             NSString *s = [NSString stringWithFormat:@"\033[%dt",
@@ -1530,6 +1622,7 @@ static const int kMaxScreenRows = 4096;
                 case 2:
                     [delegate_ terminalPushCurrentTitleForWindow:YES];
                     break;
+                // TODO: Support 3 (UTF-8)
             }
             break;
         }
@@ -1553,8 +1646,18 @@ static const int kMaxScreenRows = 4096;
             [delegate_ terminalPostGrowlNotification:token.string];
             break;
 
+        case XTERMCC_MULTITOKEN_HEADER_SET_KVP:
         case XTERMCC_SET_KVP:
             [self executeXtermSetKvp:token];
+            break;
+
+        case XTERMCC_MULTITOKEN_BODY:
+            // You'd get here if the user stops a file download before it finishes.
+            [delegate_ terminalAppendString:token.string];
+            break;
+
+        case XTERMCC_MULTITOKEN_END:
+            // Handled prior to switch.
             break;
 
         case VT100CC_NULL:

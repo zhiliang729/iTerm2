@@ -292,6 +292,10 @@ static const CGFloat kHorizontalTabBarHeight = 22;
     BOOL shouldShowToolbelt_;
 
     iTermWindowShortcutLabelTitlebarAccessoryViewController *_shortcutAccessoryViewController;
+
+    // Is there a pending delayed-perform of enterFullScreen:? Used to figure
+    // out if it's safe to toggle Lion full screen since only one can go at a time.
+    BOOL _haveDelayedEnterFullScreenMode;
 }
 
 @synthesize shouldShowToolbelt = shouldShowToolbelt_;
@@ -352,7 +356,6 @@ static const CGFloat kHorizontalTabBarHeight = 22;
     // finishes intialization. -windowInitialized will return NO until that is done.
     return [self initWithWindowNibName:@"PseudoTerminal"];
 }
-
 
 - (id)initWithSmartLayout:(BOOL)smartLayout
                windowType:(iTermWindowType)windowType
@@ -1805,6 +1808,25 @@ static const CGFloat kHorizontalTabBarHeight = 22;
     }
 }
 
+// Indicates if a newly created window will automatically enter Lion full screen.
++ (BOOL)willAutoFullScreenNewWindow {
+    PseudoTerminal *keyWindow = [[iTermController sharedInstance] keyTerminalWindow];
+    return [keyWindow lionFullScreen] || (keyWindow && keyWindow->togglingLionFullScreen_);
+}
+
++ (BOOL)anyWindowIsEnteringLionFullScreen {
+    for (PseudoTerminal *term in [[iTermController sharedInstance] terminals]) {
+        if (term->togglingLionFullScreen_ || term->_haveDelayedEnterFullScreenMode) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
++ (BOOL)arrangementIsLionFullScreen:(NSDictionary *)arrangement {
+    return [PseudoTerminal _windowTypeForArrangement:arrangement] == WINDOW_TYPE_LION_FULL_SCREEN;
+}
+
 + (PseudoTerminal*)bareTerminalWithArrangement:(NSDictionary*)arrangement
 {
     BOOL isHotkeyWindow = [arrangement[TERMINAL_ARRANGEMENT_IS_HOTKEY_WINDOW] boolValue];
@@ -2754,6 +2776,7 @@ static const CGFloat kHorizontalTabBarHeight = 22;
             if (![[NSApp keyWindow] isKindOfClass:[PopupWindow class]] &&
                 ![[NSApp keyWindow] isKindOfClass:[iTermOpenQuicklyWindow class]] &&
                 ![[[NSApp keyWindow] windowController] isKindOfClass:[ProfilesWindow class]] &&
+                ![iTermWarning showingWarning] &&
                 ![[[NSApp keyWindow] windowController] isKindOfClass:[PreferencePanel class]]) {
                 PtyLog(@"windowDidResignKey: new key window isn't popup so hide myself");
                 if ([[[NSApp keyWindow] windowController] isKindOfClass:[PseudoTerminal class]]) {
@@ -2844,6 +2867,12 @@ static const CGFloat kHorizontalTabBarHeight = 22;
             snapWidth = NO;
         }
     }
+
+    // There's an advanced preference to turn off snapping globally.
+    if ([iTermAdvancedSettingsModel disableWindowSizeSnap]) {
+        snapWidth = snapHeight = NO;
+    }
+    
     // Compute proposed tab size (window minus decorations).
     NSSize decorationSize = [self windowDecorationSize];
     NSSize tabSize = NSMakeSize(proposedFrameSize.width - decorationSize.width,
@@ -3049,6 +3078,7 @@ static const CGFloat kHorizontalTabBarHeight = 22;
 // Save to call from a timer.
 - (void)enterFullScreenMode
 {
+    _haveDelayedEnterFullScreenMode = NO;
     if (!togglingFullScreen_ &&
         !togglingLionFullScreen_ &&
         ![self anyFullScreen]) {
@@ -3125,6 +3155,7 @@ static const CGFloat kHorizontalTabBarHeight = 22;
             // call enter(Traditional)FullScreenMode instead of toggle... because
             // when doing a lion resume, the window may be toggled immediately
             // after creation by the window restorer.
+            _haveDelayedEnterFullScreenMode = YES;
             [self performSelector:@selector(enterFullScreenMode)
                        withObject:nil
                        afterDelay:0];
@@ -6973,7 +7004,7 @@ int aGlobalVariable;
     NSString *previousDirectory = nil;
     PTYSession* currentSession = [[[iTermController sharedInstance] currentTerminal] currentSession];
     if (currentSession) {
-        previousDirectory = [[currentSession shell] getWorkingDirectory];
+        previousDirectory = [currentSession currentLocalWorkingDirectory];
     }
 
     // Initialize a new session

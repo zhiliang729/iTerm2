@@ -392,7 +392,8 @@
 
 - (int)moveCursorDownOneLineScrollingIntoLineBuffer:(LineBuffer *)lineBuffer
                                 unlimitedScrollback:(BOOL)unlimitedScrollback
-                            useScrollbackWithRegion:(BOOL)useScrollbackWithRegion {
+                            useScrollbackWithRegion:(BOOL)useScrollbackWithRegion
+                                         willScroll:(void (^)())willScroll {
     // This doesn't call -bottomMargin because it was a hotspot in profiling.
     const int scrollBottom = VT100GridRangeMax(scrollRegionRows_);
 
@@ -405,6 +406,9 @@
     } else {
         // We are scrolling within a subset of the screen.
         DebugLog(@"scrolled a subset or whole screen up by 1 line");
+        if (willScroll) {
+            willScroll();
+        }
         return [self scrollUpIntoLineBuffer:lineBuffer
                         unlimitedScrollback:unlimitedScrollback
                     useScrollbackWithRegion:useScrollbackWithRegion];
@@ -455,7 +459,10 @@
 
 - (void)moveCursorRight:(int)n {
     int x = cursor_.x + n;
-    const int rightMargin = [self rightMargin];
+    int rightMargin = [self rightMargin];
+    if (cursor_.x > rightMargin) {
+        rightMargin = size_.width - 1;
+    }
 
     x = MIN(x, rightMargin);
     self.cursorX = x;
@@ -661,7 +668,8 @@
                 // Advance to the next line
                 numDropped += [self moveCursorDownOneLineScrollingIntoLineBuffer:lineBuffer
                                                              unlimitedScrollback:unlimitedScrollback
-                                                         useScrollbackWithRegion:useScrollbackWithRegion];
+                                                         useScrollbackWithRegion:useScrollbackWithRegion
+                                                                      willScroll:nil];
 
 #ifdef VERBOSE_STRING
                 NSLog(@"Advance cursor to next line");
@@ -882,7 +890,8 @@
                 self.cursorX = leftMargin;
                 numDropped += [self moveCursorDownOneLineScrollingIntoLineBuffer:lineBuffer
                                                              unlimitedScrollback:unlimitedScrollback
-                                                         useScrollbackWithRegion:useScrollbackWithRegion];
+                                                         useScrollbackWithRegion:useScrollbackWithRegion
+                                                                      willScroll:nil];
             } else {
                 self.cursorX = rightMargin - 1;
                 if (idx < len - 1) {
